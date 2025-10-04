@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-HTF scanner (updated to avoid passing requests.Session to yfinance).
+HTF scanner (robust scalar extraction + retries).
 
-Notes:
-- Do NOT pass requests.Session or a custom session into yf.download().
-  yfinance requires its own curl_cffi-backed session for Yahoo endpoints.
-- We keep per-symbol retries and backoff around yf.download(...) calls.
-- This script writes scan_results.csv in the repo root.
+Fixes:
+- Avoid using float() on a pandas Series (FutureWarning).
+- Avoid ambiguous truth-value comparisons by ensuring comparisons use scalars.
+- Keep retries/backoff and let yfinance manage its own internal session.
 """
 import os
 import sys
@@ -33,22 +32,45 @@ HTF_INTERVAL = "4h"     # high timeframe used to compute EMAs
 PERIOD = "90d"          # history length
 RETRIES = 3
 BACKOFF_BASE = 2        # seconds (exponential backoff base)
-# Note: we no longer create or pass a requests.Session to yfinance
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+
+def safe_last_scalar(series: pd.Series):
+    """
+    Return a Python float for the last non-NA element of a Series.
+    If series is empty or has no valid values return None.
+    """
+    if series is None:
+        return None
+    s = series.dropna()
+    if s.empty:
+        return None
+    try:
+        # use iat for fastest scalar access
+        val = s.iat[-1]
+        # If it is a numpy scalar convert to Python float
+        if hasattr(val, "item"):
+            return float(val.item())
+        return float(val)
+    except Exception as e:
+        logging.warning("safe_last_scalar: failed to extract scalar: %s", e)
+        try:
+            return float(s.iloc[-1])
+        except Exception:
+            return None
 
 
 def download_with_retries(ticker, attempts=RETRIES):
     """
     Download historical data for `ticker` via yfinance.download().
-    Do not pass a requests.Session — let yfinance handle its internal session.
+    Do not pass a requests.Session — let yfinance control its transport.
     Retries on exception or empty DataFrame.
     """
     last_exc = None
     for attempt in range(1, attempts + 1):
         try:
             logging.info(f"Downloading {ticker} attempt {attempt}/{attempts} (no external session)")
-            # Important: DO NOT pass a requests.Session here. Let yfinance manage transport.
             df = yf.download(tickers=ticker, period=PERIOD, interval=HTF_INTERVAL, progress=False, threads=False)
             if isinstance(df, pd.DataFrame) and not df.empty:
                 logging.info(f"Downloaded {ticker} rows={len(df)}")
@@ -62,15 +84,34 @@ def download_with_retries(ticker, attempts=RETRIES):
             sleep = BACKOFF_BASE ** (attempt - 1)
             logging.info(f"Sleeping {sleep}s before retry for {ticker}")
             time.sleep(sleep)
-    # final attempt failed
     raise last_exc if last_exc else RuntimeError(f"Failed to download {ticker} after {attempts} attempts")
 
 
 def compute_emas(df):
     close = df['Close'].dropna()
+    if close.empty:
+        return pd.Series(dtype=float), pd.Series(dtype=float)
     ema34 = close.ewm(span=34, adjust=False).mean()
     ema200 = close.ewm(span=200, adjust=False).mean()
     return ema34, ema200
+
+
+def detect_recent_cross(ema34: pd.Series, ema200: pd.Series):
+    """
+    Returns True if a sign-change in (ema34 - ema200) occurred recently (last 3 valid points).
+    Operates on Series; returns False if not enough data.
+    """
+    try:
+        diff = (ema34 - ema200).dropna()
+        if len(diff) < 3:
+            return False
+        last_vals = diff.iloc[-3:]
+        # convert to scalars and check sign change from first to last
+        a = float(last_vals.iat[0])
+        b = float(last_vals.iat[-1])
+        return (a * b) < 0
+    except Exception:
+        return False
 
 
 def main():
@@ -85,25 +126,30 @@ def main():
         try:
             df = download_with_retries(ticker, attempts=RETRIES)
             ema34, ema200 = compute_emas(df)
-            last_close = df['Close'].dropna().iloc[-1]
-            last_ema34 = float(ema34.iloc[-1]) if not ema34.empty else None
-            last_ema200 = float(ema200.iloc[-1]) if not ema200.empty else None
 
-            bias = "bull" if last_close > last_ema200 else ("bear" if last_close < last_ema200 else "neutral")
-            momentum = "bull" if last_close > last_ema34 else ("bear" if last_close < last_ema34 else "neutral")
+            # Extract scalars safely
+            last_close = safe_last_scalar(df['Close']) if 'Close' in df else None
+            last_ema34 = safe_last_scalar(ema34)
+            last_ema200 = safe_last_scalar(ema200)
 
-            cross = False
-            try:
-                diff = ema34 - ema200
-                if len(diff.dropna()) >= 3:
-                    last_vals = diff.dropna().iloc[-3:]
-                    if (last_vals.iloc[0] * last_vals.iloc[-1]) < 0:
-                        cross = True
-            except Exception:
-                cross = False
+            if last_close is None:
+                raise RuntimeError("No close price available for symbol")
+
+            # Determine bias/momentum ensuring we're comparing scalars
+            if last_ema200 is None:
+                bias = "neutral"
+            else:
+                bias = "bull" if last_close > last_ema200 else ("bear" if last_close < last_ema200 else "neutral")
+
+            if last_ema34 is None:
+                momentum = "neutral"
+            else:
+                momentum = "bull" if last_close > last_ema34 else ("bear" if last_close < last_ema34 else "neutral")
+
+            cross = detect_recent_cross(ema34, ema200)
 
             score = 0
-            if bias == momentum:
+            if bias == momentum and bias != "neutral":
                 score += 1
 
             notes = ""
@@ -120,9 +166,12 @@ def main():
                 "score": score,
                 "notes": notes
             })
-            logging.info(f"{ticker}: close={last_close} ema34={last_ema34} ema200={last_ema200} bias={bias} momentum={momentum} cross={cross}")
+
+            logging.info("%s: close=%s ema34=%s ema200=%s bias=%s momentum=%s cross=%s",
+                         ticker, last_close, last_ema34, last_ema200, bias, momentum, cross)
+
         except Exception as e:
-            logging.error(f"Failed to process {ticker}: {e}")
+            logging.error("Failed to process %s: %s", ticker, e)
             errors.append({"ticker": ticker, "error": str(e)})
             rows.append({
                 "run_time": run_time,
@@ -155,4 +204,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    main() 
