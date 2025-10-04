@@ -29,6 +29,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Debug runner workspace (helpful on first run)
+        run: |
+          echo "=== python & pip versions ==="
+          python --version || true
+          pip --version || true
+          echo "=== workspace listing ==="
+          ls -la || true
+          echo "=== requirements snapshot ==="
+          pip freeze | sed -n '1,200p' || true
+
       - name: Upgrade networking libraries for reliability
         run: |
           pip install --upgrade urllib3 requests
@@ -36,6 +46,17 @@ jobs:
       - name: Run scanner
         run: |
           python htf_scanner_all20.py
+
+      - name: Commit and push results (safer)
+        env:
+          PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add scan_results.csv
+          git diff --cached --quiet || git commit -m "Automated scan results: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          # Push using credentials setup by actions/checkout (avoid embedding tokens in logs)
+          git push origin HEAD:${{ github.ref_name }}          python htf_scanner_all20.py
 
       - name: Commit and push results
         env:
