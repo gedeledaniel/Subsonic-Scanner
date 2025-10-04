@@ -1,6 +1,6 @@
 __pycache__/
 *.pyc
 *.pyo
-*.csv
 *.json
 .env
+# Keep 'scan_results.csv' for the bot to track and push
