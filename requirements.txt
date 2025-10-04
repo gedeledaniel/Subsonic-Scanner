@@ -1,4 +1,7 @@
+fastapi
+uvicorn
 yfinance
 pandas
 requests
-urllib3
+html5lib
+yfinance-cache
